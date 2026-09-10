@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -17,18 +18,19 @@ var upgrader = websocket.Upgrader{
 }
 
 // --- ESTRUTURAS DE DADOS (JSON) ---
-// Como a App e o Servidor vão "falar" um com o outro
 type AppMessage struct {
-	Type    string `json:"type"`    // Ex: "CONNECT_BRIDGE", "SEND_MESSAGE"
-	Network string `json:"network"` // Ex: "WHATSAPP", "TELEGRAM", "MESSENGER", "SMS"
-	Payload string `json:"payload"` // Dados extra (ex: número de telefone ou texto da mensagem)
+	Type    string `json:"type"`    // Ex: "START_BRIDGE", "CONNECT_BRIDGE", "SEND_MESSAGE"
+	Network string `json:"network"` // Ex: "whatsapp", "telegram", "messenger", "messages"
+	Payload string `json:"payload"` // Dados extra
 }
 
 type ServerResponse struct {
-	Type    string `json:"type"` // Ex: "BRIDGE_STATUS", "INCOMING_MSG"
-	Network string `json:"network"`
-	Status  string `json:"status"` // Ex: "AWAITING_QR", "AWAITING_SMS", "CONNECTED"
-	Data    string `json:"data"`   // Ex: O código QR em Base64, ou o texto da mensagem
+	Type      string `json:"type"`                // "BRIDGE_STATUS", "BRIDGE_QR", "BRIDGE_CONNECTED"
+	Network   string `json:"network"`             // "whatsapp", "telegram", etc.
+	Status    string `json:"status,omitempty"`    // "A gerar QR Code...", "CONNECTED"
+	Connected bool   `json:"connected,omitempty"` // true / false
+	Payload   string `json:"payload,omitempty"`   // QR Code ou mensagem
+	Data      string `json:"data,omitempty"`      // Texto extra para retrocompatibilidade
 }
 
 // Cliente WebSocket
@@ -124,77 +126,80 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		// O "CÉREBRO" - Processar o que a App nos pediu
 		fmt.Printf("Recebido comando %s para a rede %s\n", appMsg.Type, appMsg.Network)
 
-		if appMsg.Type == "CONNECT_BRIDGE" {
+		// Aceita tanto START_BRIDGE como CONNECT_BRIDGE
+		if appMsg.Type == "START_BRIDGE" || appMsg.Type == "CONNECT_BRIDGE" {
 			go handleBridgeConnection(client, appMsg.Network)
 		}
 	}
 }
 
-// --- GESTOR DE BRIDGES (As tuas ligações às Redes) ---
-// É aqui que a verdadeira engenharia vai acontecer no futuro.
+// --- GESTOR DE BRIDGES ---
 func handleBridgeConnection(client *Client, network string) {
-	// 1. Avisamos a App que estamos a iniciar o processo...
+	normNetwork := strings.ToLower(network)
+
+	// 1. Avisar imediatamente a App que o processo iniciou
 	sendToClient(client, ServerResponse{
-		Type:    "BRIDGE_STATUS",
-		Network: network,
-		Status:  "STARTING",
-		Data:    "A iniciar motor de bridge...",
+		Type:      "BRIDGE_STATUS",
+		Network:   normNetwork,
+		Status:    "A iniciar motor da bridge...",
+		Connected: false,
 	})
 
-	time.Sleep(2 * time.Second)
+	time.Sleep(1 * time.Second)
 
-	switch network {
-	case "WHATSAPP":
-		// TODO: Integrar biblioteca "whatsmeow" aqui.
-		// Ela vai gerar um QR Code real. Aqui estamos a simular esse envio.
+	switch normNetwork {
+	case "whatsapp":
+		// Envia o QR Code para a app
 		sendToClient(client, ServerResponse{
-			Type:    "BRIDGE_STATUS",
-			Network: network,
-			Status:  "AWAITING_QR",
-			Data:    "Simulação: [IMAGEM DO QR CODE AQUI]",
+			Type:      "BRIDGE_QR",
+			Network:   normNetwork,
+			Status:    "QR Code pronto para scan",
+			Payload:   "2@SIMULACAO_QR_CODE_WHATSMEOW_TESTE",
+			Connected: false,
 		})
 
-	case "TELEGRAM":
-		// TODO: Integrar biblioteca "gotd" aqui.
-		// Precisamos de pedir à app o número de telemóvel primeiro.
+	case "telegram":
 		sendToClient(client, ServerResponse{
-			Type:    "BRIDGE_STATUS",
-			Network: network,
-			Status:  "AWAITING_PHONE_NUMBER",
-			Data:    "Insira o número de telemóvel",
+			Type:      "BRIDGE_STATUS",
+			Network:   normNetwork,
+			Status:    "Aguardando autenticação por telefone/código...",
+			Connected: false,
 		})
 
-	case "GOOGLE_MESSAGES", "SMS":
-		// TODO: Integrar puppeteer (navegador invisível) para messages.google.com
+	case "google_messages", "sms", "messages":
 		sendToClient(client, ServerResponse{
-			Type:    "BRIDGE_STATUS",
-			Network: network,
-			Status:  "AWAITING_QR",
-			Data:    "Simulação: [QR CODE DO GOOGLE MESSAGES]",
+			Type:      "BRIDGE_QR",
+			Network:   normNetwork,
+			Status:    "QR Code Google Mensagens pronto",
+			Payload:   "DEVICE_PAIRING_CODE_SIMULADO",
+			Connected: false,
 		})
 
-	case "MESSENGER":
-		// TODO: Integrar mqtt/facebook-chat-api
+	case "messenger":
 		sendToClient(client, ServerResponse{
-			Type:    "BRIDGE_STATUS",
-			Network: network,
-			Status:  "AWAITING_LOGIN",
-			Data:    "Insira credenciais do Meta",
+			Type:      "BRIDGE_STATUS",
+			Network:   normNetwork,
+			Status:    "Aguardando credenciais do Meta...",
+			Connected: false,
 		})
 	}
 
-	// Simular que o utilizador leu o QR / Inseriu o Código passado 10 segundos
+	// Simula a confirmação da ligação após 10 segundos
 	time.Sleep(10 * time.Second)
 	sendToClient(client, ServerResponse{
-		Type:    "BRIDGE_STATUS",
-		Network: network,
-		Status:  "CONNECTED",
-		Data:    "Sincronização de mensagens iniciada com sucesso!",
+		Type:      "BRIDGE_STATUS",
+		Network:   normNetwork,
+		Status:    "Conectado",
+		Connected: true,
 	})
 }
 
 // Função utilitária para converter as respostas em JSON e enviar para a App
 func sendToClient(client *Client, resp ServerResponse) {
-	jsonBytes, _ := json.Marshal(resp)
+	jsonBytes, err := json.Marshal(resp)
+	if err != nil {
+		fmt.Println("Erro no Marshal:", err)
+		return
+	}
 	client.Send <- jsonBytes
 }
