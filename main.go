@@ -25,9 +25,9 @@ var upgrader = websocket.Upgrader{
 }
 
 type AppMessage struct {
-	Type    string `json:"type"`    // Ex: "START_BRIDGE", "SEND_PHONE", "SEND_CODE"
-	Network string `json:"network"` // Ex: "whatsapp", "telegram", etc.
-	Payload string `json:"payload"` // Ex: "+351912345678" ou "12345"
+	Type    string `json:"type"`
+	Network string `json:"network"`
+	Payload string `json:"payload"`
 }
 
 type ServerResponse struct {
@@ -78,7 +78,8 @@ func main() {
 
 func initWhatsAppStore() {
 	dbLog := waLog.Stdout("Database", "INFO", true)
-	container, err := sqlstore.New("sqlite", "file:whatsapp.db?_pragma=foreign_keys(1)", dbLog)
+	// Corrigido: adicionado context.Background() como 1º argumento
+	container, err := sqlstore.New(context.Background(), "sqlite", "file:whatsapp.db?_pragma=foreign_keys(1)", dbLog)
 	if err != nil {
 		log.Println("Erro ao inicializar SQLite WhatsApp:", err)
 		return
@@ -184,7 +185,6 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		case "SEND_CODE":
 			if norm == "telegram" {
 				fmt.Printf("A validar código do Telegram: %s\n", appMsg.Payload)
-				// Aqui conectará à sessão do Telegram
 				sendToClient(client, ServerResponse{
 					Type:      "BRIDGE_STATUS",
 					Network:   "telegram",
@@ -210,7 +210,8 @@ func startRealWhatsAppBridge(client *Client) {
 		return
 	}
 
-	deviceStore, err := waContainer.GetFirstDevice()
+	// Corrigido: adicionado context.Background() como argumento
+	deviceStore, err := waContainer.GetFirstDevice(context.Background())
 	if err != nil {
 		log.Println("Erro ao obter deviceStore:", err)
 		return
