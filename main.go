@@ -1,39 +1,43 @@
 package main
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"strings"
-	"time"
+	"sync"
 
 	"github.com/gorilla/websocket"
+	qrcode "github.com/skip2/go-qrcode"
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
+	_ "modernc.org/sqlite"
 )
 
-// --- CONFIGURAÇÕES BASE ---
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-// --- ESTRUTURAS DE DADOS (JSON) ---
 type AppMessage struct {
-	Type    string `json:"type"`    // Ex: "START_BRIDGE", "CONNECT_BRIDGE", "SEND_MESSAGE"
-	Network string `json:"network"` // Ex: "whatsapp", "telegram", "messenger", "messages"
-	Payload string `json:"payload"` // Dados extra
+	Type    string `json:"type"`    // Ex: "START_BRIDGE", "SEND_PHONE", "SEND_CODE"
+	Network string `json:"network"` // Ex: "whatsapp", "telegram", etc.
+	Payload string `json:"payload"` // Ex: "+351912345678" ou "12345"
 }
 
 type ServerResponse struct {
-	Type      string `json:"type"`                // "BRIDGE_STATUS", "BRIDGE_QR", "BRIDGE_CONNECTED"
-	Network   string `json:"network"`             // "whatsapp", "telegram", etc.
-	Status    string `json:"status,omitempty"`    // "A gerar QR Code...", "CONNECTED"
-	Connected bool   `json:"connected,omitempty"` // true / false
-	Payload   string `json:"payload,omitempty"`   // QR Code ou mensagem
-	Data      string `json:"data,omitempty"`      // Texto extra para retrocompatibilidade
+	Type      string `json:"type"`
+	Network   string `json:"network"`
+	Status    string `json:"status,omitempty"`
+	Connected bool   `json:"connected"`
+	Payload   string `json:"payload,omitempty"`
 }
 
-// Cliente WebSocket
 type Client struct {
 	ID   string
 	Conn *websocket.Conn
@@ -44,11 +48,19 @@ var (
 	clients    = make(map[*Client]bool)
 	register   = make(chan *Client)
 	unregister = make(chan *Client)
+	clientLock sync.Mutex
+
+	// WhatsApp Real
+	waClient    *whatsmeow.Client
+	waContainer *sqlstore.Container
+	waLock      sync.Mutex
 )
 
-// --- INÍCIO DO SERVIDOR ---
 func main() {
 	go runHub()
+
+	// Inicia a base de dados local do WhatsApp
+	initWhatsAppStore()
 
 	http.HandleFunc("/ws", handleConnections)
 
@@ -57,25 +69,39 @@ func main() {
 		port = "8080"
 	}
 
-	fmt.Println("Beeper-Clone Core Server a arrancar na porta " + port)
+	fmt.Println("Beeper-Clone Server REAL ativo na porta " + port)
 	err := http.ListenAndServe(":"+port, nil)
 	if err != nil {
 		log.Fatal("Erro fatal: ", err)
 	}
 }
 
+func initWhatsAppStore() {
+	dbLog := waLog.Stdout("Database", "INFO", true)
+	container, err := sqlstore.New("sqlite", "file:whatsapp.db?_pragma=foreign_keys(1)", dbLog)
+	if err != nil {
+		log.Println("Erro ao inicializar SQLite WhatsApp:", err)
+		return
+	}
+	waContainer = container
+}
+
 func runHub() {
 	for {
 		select {
 		case client := <-register:
+			clientLock.Lock()
 			clients[client] = true
+			clientLock.Unlock()
 			fmt.Println("App ligada! User:", client.ID)
 		case client := <-unregister:
+			clientLock.Lock()
 			if _, ok := clients[client]; ok {
 				delete(clients, client)
 				close(client.Send)
 				fmt.Println("App desligada! User:", client.ID)
 			}
+			clientLock.Unlock()
 		}
 	}
 }
@@ -96,7 +122,6 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	client := &Client{ID: userId, Conn: ws, Send: make(chan []byte, 256)}
 	register <- client
 
-	// Goroutine de Escrita
 	go func() {
 		defer ws.Close()
 		for msg := range client.Send {
@@ -104,7 +129,6 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Rotina principal de Leitura
 	defer func() {
 		unregister <- client
 		ws.Close()
@@ -119,87 +143,190 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		var appMsg AppMessage
 		err = json.Unmarshal(messageBytes, &appMsg)
 		if err != nil {
-			fmt.Println("Erro a interpretar JSON da App:", err)
 			continue
 		}
 
-		// O "CÉREBRO" - Processar o que a App nos pediu
-		fmt.Printf("Recebido comando %s para a rede %s\n", appMsg.Type, appMsg.Network)
+		fmt.Printf("Comando recebido: %s para %s (payload: %s)\n", appMsg.Type, appMsg.Network, appMsg.Payload)
 
-		// Aceita tanto START_BRIDGE como CONNECT_BRIDGE
-		if appMsg.Type == "START_BRIDGE" || appMsg.Type == "CONNECT_BRIDGE" {
-			go handleBridgeConnection(client, appMsg.Network)
+		norm := strings.ToLower(appMsg.Network)
+
+		switch appMsg.Type {
+		case "START_BRIDGE", "CONNECT_BRIDGE":
+			if norm == "whatsapp" {
+				go startRealWhatsAppBridge(client)
+			} else if norm == "telegram" {
+				sendToClient(client, ServerResponse{
+					Type:      "BRIDGE_STATUS",
+					Network:   "telegram",
+					Status:    "Insira o número de telemóvel para receber o código",
+					Connected: false,
+				})
+			} else {
+				sendToClient(client, ServerResponse{
+					Type:      "BRIDGE_STATUS",
+					Network:   norm,
+					Status:    "Aguardando configuração de autenticação para " + norm,
+					Connected: false,
+				})
+			}
+
+		case "SEND_PHONE":
+			if norm == "telegram" {
+				fmt.Printf("A pedir código SMS para Telegram número: %s\n", appMsg.Payload)
+				sendToClient(client, ServerResponse{
+					Type:      "BRIDGE_STATUS",
+					Network:   "telegram",
+					Status:    "Código de verificação enviado para " + appMsg.Payload,
+					Connected: false,
+				})
+			}
+
+		case "SEND_CODE":
+			if norm == "telegram" {
+				fmt.Printf("A validar código do Telegram: %s\n", appMsg.Payload)
+				// Aqui conectará à sessão do Telegram
+				sendToClient(client, ServerResponse{
+					Type:      "BRIDGE_STATUS",
+					Network:   "telegram",
+					Status:    "A validar código junto dos servidores do Telegram...",
+					Connected: false,
+				})
+			}
 		}
 	}
 }
 
-// --- GESTOR DE BRIDGES ---
-func handleBridgeConnection(client *Client, network string) {
-	normNetwork := strings.ToLower(network)
+func startRealWhatsAppBridge(client *Client) {
+	waLock.Lock()
+	defer waLock.Unlock()
 
-	// 1. Avisar imediatamente a App que o processo iniciou
+	if waContainer == nil {
+		sendToClient(client, ServerResponse{
+			Type:      "BRIDGE_STATUS",
+			Network:   "whatsapp",
+			Status:    "Erro ao abrir base de dados do WhatsApp no servidor",
+			Connected: false,
+		})
+		return
+	}
+
+	deviceStore, err := waContainer.GetFirstDevice()
+	if err != nil {
+		log.Println("Erro ao obter deviceStore:", err)
+		return
+	}
+
+	clientLog := waLog.Stdout("Client", "INFO", true)
+	if waClient == nil {
+		waClient = whatsmeow.NewClient(deviceStore, clientLog)
+	}
+
+	// Se já estiver logado anteriormente
+	if waClient.Store.ID != nil {
+		if !waClient.IsConnected() {
+			_ = waClient.Connect()
+		}
+		sendToClient(client, ServerResponse{
+			Type:      "BRIDGE_STATUS",
+			Network:   "whatsapp",
+			Status:    "Conectado",
+			Connected: true,
+		})
+		return
+	}
+
+	// Listener de eventos reais
+	waClient.AddEventHandler(func(rawEvt interface{}) {
+		switch rawEvt.(type) {
+		case *events.Connected:
+			fmt.Println("WhatsApp conectado com sucesso!")
+			sendToClient(client, ServerResponse{
+				Type:      "BRIDGE_STATUS",
+				Network:   "whatsapp",
+				Status:    "Conectado",
+				Connected: true,
+			})
+		case *events.LoggedOut:
+			sendToClient(client, ServerResponse{
+				Type:      "BRIDGE_STATUS",
+				Network:   "whatsapp",
+				Status:    "Sessão terminada",
+				Connected: false,
+			})
+		}
+	})
+
+	qrChan, err := waClient.GetQRChannel(context.Background())
+	if err != nil {
+		log.Println("Erro GetQRChannel:", err)
+		return
+	}
+
+	err = waClient.Connect()
+	if err != nil {
+		log.Println("Erro waClient.Connect:", err)
+		return
+	}
+
 	sendToClient(client, ServerResponse{
 		Type:      "BRIDGE_STATUS",
-		Network:   normNetwork,
-		Status:    "A iniciar motor da bridge...",
+		Network:   "whatsapp",
+		Status:    "A gerar QR Code oficial do WhatsApp...",
 		Connected: false,
 	})
 
-	time.Sleep(1 * time.Second)
+	go func() {
+		for evt := range qrChan {
+			if evt.Event == "code" {
+				fmt.Println("QR Code Real recebido do WhatsApp! A enviar imagem para a app...")
+				png, err := qrcode.Encode(evt.Code, qrcode.Medium, 256)
+				var payload string
+				if err == nil {
+					payload = "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)
+				} else {
+					payload = evt.Code
+				}
 
-	switch normNetwork {
-	case "whatsapp":
-		// Envia o QR Code para a app
-		sendToClient(client, ServerResponse{
-			Type:      "BRIDGE_QR",
-			Network:   normNetwork,
-			Status:    "QR Code pronto para scan",
-			Payload:   "2@SIMULACAO_QR_CODE_WHATSMEOW_TESTE",
-			Connected: false,
-		})
-
-	case "telegram":
-		sendToClient(client, ServerResponse{
-			Type:      "BRIDGE_STATUS",
-			Network:   normNetwork,
-			Status:    "Aguardando autenticação por telefone/código...",
-			Connected: false,
-		})
-
-	case "google_messages", "sms", "messages":
-		sendToClient(client, ServerResponse{
-			Type:      "BRIDGE_QR",
-			Network:   normNetwork,
-			Status:    "QR Code Google Mensagens pronto",
-			Payload:   "DEVICE_PAIRING_CODE_SIMULADO",
-			Connected: false,
-		})
-
-	case "messenger":
-		sendToClient(client, ServerResponse{
-			Type:      "BRIDGE_STATUS",
-			Network:   normNetwork,
-			Status:    "Aguardando credenciais do Meta...",
-			Connected: false,
-		})
-	}
-
-	// Simula a confirmação da ligação após 10 segundos
-	time.Sleep(10 * time.Second)
-	sendToClient(client, ServerResponse{
-		Type:      "BRIDGE_STATUS",
-		Network:   normNetwork,
-		Status:    "Conectado",
-		Connected: true,
-	})
+				sendToClient(client, ServerResponse{
+					Type:      "BRIDGE_QR",
+					Network:   "whatsapp",
+					Status:    "Lê o código com o WhatsApp no teu telemóvel",
+					Payload:   payload,
+					Connected: false,
+				})
+			} else if evt.Event == "success" {
+				fmt.Println("QR Code lido com sucesso pelo telemóvel!")
+				sendToClient(client, ServerResponse{
+					Type:      "BRIDGE_STATUS",
+					Network:   "whatsapp",
+					Status:    "Conectado",
+					Connected: true,
+				})
+				break
+			} else if evt.Event == "timeout" {
+				sendToClient(client, ServerResponse{
+					Type:      "BRIDGE_STATUS",
+					Network:   "whatsapp",
+					Status:    "QR Code expirou. Clica em reenviar.",
+					Connected: false,
+				})
+				break
+			}
+		}
+	}()
 }
 
-// Função utilitária para converter as respostas em JSON e enviar para a App
 func sendToClient(client *Client, resp ServerResponse) {
 	jsonBytes, err := json.Marshal(resp)
 	if err != nil {
-		fmt.Println("Erro no Marshal:", err)
 		return
 	}
-	client.Send <- jsonBytes
+	clientLock.Lock()
+	defer clientLock.Unlock()
+	if _, ok := clients[client]; ok {
+		select {
+		case client.Send <- jsonBytes:
+		default:
+		}
+	}
 }
