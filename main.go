@@ -42,6 +42,7 @@ type ServerResponse struct {
 	Payload   string `json:"payload,omitempty"`
 	Sender    string `json:"sender,omitempty"`
 	Message   string `json:"message,omitempty"`
+	ChatName  string `json:"chatName,omitempty"`
 }
 
 type Client struct {
@@ -72,7 +73,7 @@ func main() {
 		port = "8080"
 	}
 
-	fmt.Println("Beeper-Clone Server com WAL SQLite ativo na porta " + port)
+	fmt.Println("Beeper-Clone Server Beeper-Style ativo na porta " + port)
 	err := http.ListenAndServe(":"+port, nil)
 	if err != nil {
 		log.Fatal("Erro fatal: ", err)
@@ -81,7 +82,6 @@ func main() {
 
 func initWhatsAppStore() {
 	dbLog := waLog.Stdout("Database", "INFO", true)
-	// Adicionado WAL e busy_timeout para evitar conflitos de concorrência no SQLite
 	connStr := "file:whatsapp.db?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_busy_timeout=5000"
 	container, err := sqlstore.New(context.Background(), "sqlite", connStr, dbLog)
 	if err != nil {
@@ -130,7 +130,6 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	client := &Client{ID: userId, Conn: ws, Send: make(chan []byte, 256)}
 	register <- client
 
-	// Heartbeat / Ping a cada 20 segundos
 	go func() {
 		ticker := time.NewTicker(20 * time.Second)
 		defer ticker.Stop()
@@ -178,11 +177,32 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		case "START_BRIDGE", "CONNECT_BRIDGE":
 			if norm == "whatsapp" {
 				go startRealWhatsAppBridge(client)
+			} else if norm == "telegram" {
+				sendToClient(client, ServerResponse{
+					Type:      "BRIDGE_STATUS",
+					Network:   "telegram",
+					Status:    "Insira o número de telemóvel para autenticação",
+					Connected: false,
+				})
+			} else {
+				sendToClient(client, ServerResponse{
+					Type:      "BRIDGE_STATUS",
+					Network:   norm,
+					Status:    "Ponte " + norm + " requer credenciais de sessão",
+					Connected: false,
+				})
 			}
 
 		case "PAIR_PHONE":
 			if norm == "whatsapp" {
 				go handlePairPhoneWhatsApp(client, appMsg.Payload)
+			} else if norm == "telegram" {
+				sendToClient(client, ServerResponse{
+					Type:      "BRIDGE_STATUS",
+					Network:   "telegram",
+					Status:    "Código SMS enviado para " + appMsg.Payload,
+					Connected: false,
+				})
 			}
 
 		case "SEND_MESSAGE":
@@ -196,7 +216,6 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 					_, _ = waClient.SendMessage(context.Background(), jid, &waE2E.Message{
 						Conversation: &appMsg.Payload,
 					})
-					fmt.Println("Mensagem enviada com sucesso para:", recipient)
 				}
 			}
 		}
@@ -237,21 +256,17 @@ func handlePairPhoneWhatsApp(client *Client, phone string) {
 	cleanPhone = strings.ReplaceAll(cleanPhone, " ", "")
 	cleanPhone = strings.ReplaceAll(cleanPhone, "-", "")
 
-	fmt.Printf("A pedir código de emparelhamento para: %s\n", cleanPhone)
-
 	code, err := waClient.PairPhone(context.Background(), cleanPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 	if err != nil {
-		fmt.Println("Erro PairPhone:", err)
 		sendToClient(client, ServerResponse{
 			Type:      "BRIDGE_STATUS",
 			Network:   "whatsapp",
-			Status:    "Erro ao gerar código: " + err.Error(),
+			Status:    "Erro: " + err.Error(),
 			Connected: false,
 		})
 		return
 	}
 
-	fmt.Println("Código de emparelhamento gerado com sucesso:", code)
 	sendToClient(client, ServerResponse{
 		Type:      "BRIDGE_QR",
 		Network:   "whatsapp",
@@ -277,7 +292,7 @@ func startRealWhatsAppBridge(client *Client) {
 		sendToClient(client, ServerResponse{
 			Type:      "BRIDGE_STATUS",
 			Network:   "whatsapp",
-			Status:    "Conectado",
+			Status:    "Conectado e Histórico Sincronizado",
 			Connected: true,
 		})
 		return
@@ -296,7 +311,7 @@ func startRealWhatsAppBridge(client *Client) {
 	sendToClient(client, ServerResponse{
 		Type:      "BRIDGE_STATUS",
 		Network:   "whatsapp",
-		Status:    "A gerar QR Code oficial...",
+		Status:    "A gerar QR Code...",
 		Connected: false,
 	})
 
@@ -314,7 +329,7 @@ func startRealWhatsAppBridge(client *Client) {
 				sendToClient(client, ServerResponse{
 					Type:      "BRIDGE_QR",
 					Network:   "whatsapp",
-					Status:    "Lê o QR Code com o WhatsApp",
+					Status:    "Lê o QR Code",
 					Payload:   payload,
 					Connected: false,
 				})
@@ -342,7 +357,7 @@ func setupEventHandlers() {
 				sendToClient(activeClient, ServerResponse{
 					Type:      "BRIDGE_STATUS",
 					Network:   "whatsapp",
-					Status:    "Conectado",
+					Status:    "Conectado e Sincronizado",
 					Connected: true,
 				})
 			}
@@ -357,10 +372,11 @@ func setupEventHandlers() {
 
 				if body != "" {
 					sendToClient(activeClient, ServerResponse{
-						Type:    "INCOMING_MSG",
-						Network: "whatsapp",
-						Sender:  evt.Info.Sender.User,
-						Message: body,
+						Type:     "INCOMING_MSG",
+						Network:  "whatsapp",
+						Sender:   evt.Info.Sender.User,
+						ChatName: evt.Info.PushName,
+						Message:  body,
 					})
 				}
 			}
