@@ -72,7 +72,7 @@ func main() {
 		port = "8080"
 	}
 
-	fmt.Println("Beeper-Clone Server com Pairing Code ativo na porta " + port)
+	fmt.Println("Beeper-Clone Server com WAL SQLite ativo na porta " + port)
 	err := http.ListenAndServe(":"+port, nil)
 	if err != nil {
 		log.Fatal("Erro fatal: ", err)
@@ -81,7 +81,9 @@ func main() {
 
 func initWhatsAppStore() {
 	dbLog := waLog.Stdout("Database", "INFO", true)
-	container, err := sqlstore.New(context.Background(), "sqlite", "file:whatsapp.db?_pragma=foreign_keys(1)", dbLog)
+	// Adicionado WAL e busy_timeout para evitar conflitos de concorrência no SQLite
+	connStr := "file:whatsapp.db?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_busy_timeout=5000"
+	container, err := sqlstore.New(context.Background(), "sqlite", connStr, dbLog)
 	if err != nil {
 		log.Println("Erro SQLite WhatsApp:", err)
 		return
@@ -237,7 +239,6 @@ func handlePairPhoneWhatsApp(client *Client, phone string) {
 
 	fmt.Printf("A pedir código de emparelhamento para: %s\n", cleanPhone)
 
-	// Corrigido com context.Background()
 	code, err := waClient.PairPhone(context.Background(), cleanPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 	if err != nil {
 		fmt.Println("Erro PairPhone:", err)
