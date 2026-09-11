@@ -109,7 +109,6 @@ func initWhatsAppStore() {
 	}
 	waContainer = container
 
-	// Abrir ligação direta ao SQLite para guardar as mensagens do histórico
 	db, err := sql.Open("sqlite", connStr)
 	if err != nil {
 		log.Println("Erro ao abrir base de dados para histórico:", err)
@@ -296,7 +295,6 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 					_, _ = waClient.SendMessage(context.Background(), jid, &waE2E.Message{
 						Conversation: &appMsg.Payload,
 					})
-					// Guardar a mensagem enviada também no histórico local
 					if historyDB != nil {
 						_, _ = historyDB.Exec(
 							"INSERT OR REPLACE INTO whatsapp_messages (msg_id, chat_jid, chat_name, message_text, timestamp, from_me) VALUES (?, ?, ?, ?, ?, ?)",
@@ -340,7 +338,6 @@ func sendFullHistory(client *Client) {
 		return
 	}
 
-	// 1. Ler todas as mensagens reais guardadas no SQLite
 	rows, err := historyDB.Query("SELECT msg_id, chat_jid, chat_name, message_text, timestamp, from_me FROM whatsapp_messages ORDER BY timestamp ASC")
 	if err != nil {
 		fmt.Println("Erro a ler mensagens do SQLite:", err)
@@ -495,7 +492,6 @@ func setupEventHandlers() {
 			}
 
 		case *events.HistorySync:
-			// Processar conversas e MENSAGENS REAIS do histórico
 			if evt.Data == nil || historyDB == nil {
 				return
 			}
@@ -508,27 +504,33 @@ func setupEventHandlers() {
 				}
 
 				for _, histMsg := range conv.GetMessages() {
-					msg := histMsg.GetMessage()
-					if msg == nil {
+					// No WhatsMeow, histMsg.GetMsg() devolve o WebMessageInfo
+					webMsg := histMsg.GetMsg()
+					if webMsg == nil {
+						continue
+					}
+
+					rawMsg := webMsg.GetMessage()
+					if rawMsg == nil {
 						continue
 					}
 
 					var text string
-					if msg.GetConversation() != "" {
-						text = msg.GetConversation()
-					} else if msg.GetExtendedTextMessage() != nil {
-						text = msg.GetExtendedTextMessage().GetText()
-					} else if msg.GetImageMessage() != nil {
-						text = "[Imagem] " + msg.GetImageMessage().GetCaption()
+					if rawMsg.GetConversation() != "" {
+						text = rawMsg.GetConversation()
+					} else if rawMsg.GetExtendedTextMessage() != nil {
+						text = rawMsg.GetExtendedTextMessage().GetText()
+					} else if rawMsg.GetImageMessage() != nil {
+						text = "[Imagem] " + rawMsg.GetImageMessage().GetCaption()
 					}
 
 					if text == "" {
 						continue
 					}
 
-					msgID := histMsg.GetKey().GetId()
-					fromMe := histMsg.GetKey().GetFromMe()
-					ts := int64(histMsg.GetMessageTimestamp()) * 1000
+					msgID := webMsg.GetKey().GetId()
+					fromMe := webMsg.GetKey().GetFromMe()
+					ts := int64(webMsg.GetMessageTimestamp()) * 1000
 
 					_, _ = historyDB.Exec(
 						"INSERT OR IGNORE INTO whatsapp_messages (msg_id, chat_jid, chat_name, message_text, timestamp, from_me) VALUES (?, ?, ?, ?, ?, ?)",
@@ -560,7 +562,6 @@ func setupEventHandlers() {
 				msgID := evt.Info.ID
 				ts := evt.Info.Timestamp.UnixMilli()
 
-				// Guardar na tabela permanente de histórico
 				if historyDB != nil {
 					_, _ = historyDB.Exec(
 						"INSERT OR IGNORE INTO whatsapp_messages (msg_id, chat_jid, chat_name, message_text, timestamp, from_me) VALUES (?, ?, ?, ?, ?, ?)",
