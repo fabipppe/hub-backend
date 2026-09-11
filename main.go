@@ -532,7 +532,7 @@ func setupEventHandlers() {
 							text = "[Imagem]"
 						}
 						// Descarregar a imagem para renderizar na UI
-						if data, err := waClient.Download(imgMsg); err == nil {
+						if data, err := waClient.Download(context.Background(), imgMsg); err == nil {
 							mime := imgMsg.GetMimetype()
 							if mime == "" {
 								mime = "image/jpeg"
@@ -574,7 +574,7 @@ func setupEventHandlers() {
 					body = "[Imagem]"
 				}
 				// Download da imagem em tempo real
-				if data, err := waClient.Download(imgMsg); err == nil {
+				if data, err := waClient.Download(context.Background(), imgMsg); err == nil {
 					mime := imgMsg.GetMimetype()
 					if mime == "" {
 						mime = "image/jpeg"
