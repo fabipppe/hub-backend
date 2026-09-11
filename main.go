@@ -73,7 +73,7 @@ func main() {
 		port = "8080"
 	}
 
-	fmt.Println("Beeper-Clone Server Beeper-Style ativo na porta " + port)
+	fmt.Println("Beeper-Clone Server Beeper-Style com WAL ativo na porta " + port)
 	err := http.ListenAndServe(":"+port, nil)
 	if err != nil {
 		log.Fatal("Erro fatal: ", err)
@@ -82,6 +82,7 @@ func main() {
 
 func initWhatsAppStore() {
 	dbLog := waLog.Stdout("Database", "INFO", true)
+	// Configuração WAL e busy_timeout rigorosa para evitar SQLITE_BUSY
 	connStr := "file:whatsapp.db?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_busy_timeout=5000"
 	container, err := sqlstore.New(context.Background(), "sqlite", connStr, dbLog)
 	if err != nil {
