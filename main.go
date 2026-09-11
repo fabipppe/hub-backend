@@ -73,7 +73,7 @@ func main() {
 		port = "8080"
 	}
 
-	fmt.Println("Beeper-Clone Server Beeper-Style com WAL ativo na porta " + port)
+	fmt.Println("Beeper-Clone Server com Histórico Ativo na porta " + port)
 	err := http.ListenAndServe(":"+port, nil)
 	if err != nil {
 		log.Fatal("Erro fatal: ", err)
@@ -82,7 +82,6 @@ func main() {
 
 func initWhatsAppStore() {
 	dbLog := waLog.Stdout("Database", "INFO", true)
-	// Configuração WAL e busy_timeout rigorosa para evitar SQLITE_BUSY
 	connStr := "file:whatsapp.db?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_busy_timeout=5000"
 	container, err := sqlstore.New(context.Background(), "sqlite", connStr, dbLog)
 	if err != nil {
@@ -178,18 +177,11 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		case "START_BRIDGE", "CONNECT_BRIDGE":
 			if norm == "whatsapp" {
 				go startRealWhatsAppBridge(client)
-			} else if norm == "telegram" {
-				sendToClient(client, ServerResponse{
-					Type:      "BRIDGE_STATUS",
-					Network:   "telegram",
-					Status:    "Insira o número de telemóvel para autenticação",
-					Connected: false,
-				})
 			} else {
 				sendToClient(client, ServerResponse{
 					Type:      "BRIDGE_STATUS",
 					Network:   norm,
-					Status:    "Ponte " + norm + " requer credenciais de sessão",
+					Status:    "Rede " + norm + " aguarda configuração",
 					Connected: false,
 				})
 			}
@@ -197,13 +189,6 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		case "PAIR_PHONE":
 			if norm == "whatsapp" {
 				go handlePairPhoneWhatsApp(client, appMsg.Payload)
-			} else if norm == "telegram" {
-				sendToClient(client, ServerResponse{
-					Type:      "BRIDGE_STATUS",
-					Network:   "telegram",
-					Status:    "Código SMS enviado para " + appMsg.Payload,
-					Connected: false,
-				})
 			}
 
 		case "SEND_MESSAGE":
@@ -293,7 +278,7 @@ func startRealWhatsAppBridge(client *Client) {
 		sendToClient(client, ServerResponse{
 			Type:      "BRIDGE_STATUS",
 			Network:   "whatsapp",
-			Status:    "Conectado e Histórico Sincronizado",
+			Status:    "Conectado e Sincronizado",
 			Connected: true,
 		})
 		return
@@ -358,9 +343,29 @@ func setupEventHandlers() {
 				sendToClient(activeClient, ServerResponse{
 					Type:      "BRIDGE_STATUS",
 					Network:   "whatsapp",
-					Status:    "Conectado e Sincronizado",
+					Status:    "Conectado",
 					Connected: true,
 				})
+			}
+		case *events.HistorySync:
+			// Captura o histórico sincronizado do WhatsApp e envia conversas para a app
+			if activeClient != nil && evt.Data != nil {
+				fmt.Printf("Histórico sincronizado recebido: %d conversas\n", len(evt.Data.GetConversations()))
+				for _, conv := range evt.Data.GetConversations() {
+					chatName := conv.GetId()
+					if conv.GetName() != "" {
+						chatName = conv.GetName()
+					}
+
+					// Envia cada chat do histórico para a app preencher
+					sendToClient(activeClient, ServerResponse{
+						Type:     "INCOMING_MSG",
+						Network:  "whatsapp",
+						Sender:   conv.GetId(),
+						ChatName: chatName,
+						Message:  "[Histórico sincronizado]",
+					})
+				}
 			}
 		case *events.Message:
 			if activeClient != nil {
@@ -372,11 +377,15 @@ func setupEventHandlers() {
 				}
 
 				if body != "" {
+					chatName := evt.Info.PushName
+					if chatName == "" {
+						chatName = evt.Info.Sender.User
+					}
 					sendToClient(activeClient, ServerResponse{
 						Type:     "INCOMING_MSG",
 						Network:  "whatsapp",
 						Sender:   evt.Info.Sender.User,
-						ChatName: evt.Info.PushName,
+						ChatName: chatName,
 						Message:  body,
 					})
 				}
