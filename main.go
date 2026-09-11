@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -303,10 +304,10 @@ func startRealWhatsAppBridge(client *Client) {
 	go func() {
 		for evt := range qrChan {
 			if evt.Event == "code" {
-				png, err := qrcode.Encode(evt.Code, qrcode.Medium, 256)
+				pngBytes, err := qrcode.Encode(evt.Code, qrcode.Medium, 256)
 				var payload string
 				if err == nil {
-					payload = "data:image/png;base64,+base64.StdEncoding.EncodeToString(png)"
+					payload = "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBytes)
 				} else {
 					payload = evt.Code
 				}
