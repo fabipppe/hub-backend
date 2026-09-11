@@ -504,7 +504,6 @@ func setupEventHandlers() {
 				}
 
 				for _, histMsg := range conv.GetMessages() {
-					// histMsg.GetMessage() devolve o WebMessageInfo
 					webMsg := histMsg.GetMessage()
 					if webMsg == nil {
 						continue
@@ -528,7 +527,7 @@ func setupEventHandlers() {
 						continue
 					}
 
-					msgID := webMsg.GetKey().GetId()
+					msgID := webMsg.GetKey().GetID()
 					fromMe := webMsg.GetKey().GetFromMe()
 					ts := int64(webMsg.GetMessageTimestamp()) * 1000
 
