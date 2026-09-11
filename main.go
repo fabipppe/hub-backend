@@ -28,9 +28,9 @@ var upgrader = websocket.Upgrader{
 }
 
 type AppMessage struct {
-	Type      string `json:"type"`    // "START_BRIDGE", "PAIR_PHONE", "SEND_MESSAGE", "PING"
-	Network   string `json:"network"` // "whatsapp"
-	Payload   string `json:"payload"` // Telefone ou texto
+	Type      string `json:"type"`
+	Network   string `json:"network"`
+	Payload   string `json:"payload"`
 	Recipient string `json:"recipient,omitempty"`
 }
 
@@ -128,7 +128,7 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	client := &Client{ID: userId, Conn: ws, Send: make(chan []byte, 256)}
 	register <- client
 
-	// Heartbeat / Ping a cada 20 segundos para manter vivo no Render
+	// Heartbeat / Ping a cada 20 segundos
 	go func() {
 		ticker := time.NewTicker(20 * time.Second)
 		defer ticker.Stop()
@@ -231,13 +231,14 @@ func handlePairPhoneWhatsApp(client *Client, phone string) {
 		_ = waClient.Connect()
 	}
 
-	// Limpar caracteres não numéricos do telefone
 	cleanPhone := strings.ReplaceAll(phone, "+", "")
 	cleanPhone = strings.ReplaceAll(cleanPhone, " ", "")
 	cleanPhone = strings.ReplaceAll(cleanPhone, "-", "")
 
 	fmt.Printf("A pedir código de emparelhamento para: %s\n", cleanPhone)
-	code, err := waClient.PairPhone(cleanPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+
+	// Corrigido com context.Background()
+	code, err := waClient.PairPhone(context.Background(), cleanPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 	if err != nil {
 		fmt.Println("Erro PairPhone:", err)
 		sendToClient(client, ServerResponse{
@@ -254,7 +255,7 @@ func handlePairPhoneWhatsApp(client *Client, phone string) {
 		Type:      "BRIDGE_QR",
 		Network:   "whatsapp",
 		Status:    "Insere este código no WhatsApp",
-		Payload:   code, // Código de 8 dígitos, ex: ABCD-1234
+		Payload:   code,
 		Connected: false,
 	})
 }
