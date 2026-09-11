@@ -28,9 +28,9 @@ var upgrader = websocket.Upgrader{
 }
 
 type AppMessage struct {
-	Type      string `json:"type"`    // "START_BRIDGE", "SEND_MESSAGE", "PING"
+	Type      string `json:"type"`    // "START_BRIDGE", "PAIR_PHONE", "SEND_MESSAGE", "PING"
 	Network   string `json:"network"` // "whatsapp"
-	Payload   string `json:"payload"` // Texto da mensagem ou destinatário
+	Payload   string `json:"payload"` // Telefone ou texto
 	Recipient string `json:"recipient,omitempty"`
 }
 
@@ -51,11 +51,10 @@ type Client struct {
 }
 
 var (
-	clients    = make(map[*Client]bool)
-	register   = make(chan *Client)
-	unregister = make(chan *Client)
-	clientLock sync.Mutex
-
+	clients      = make(map[*Client]bool)
+	register     = make(chan *Client)
+	unregister   = make(chan *Client)
+	clientLock   sync.Mutex
 	waClient     *whatsmeow.Client
 	waContainer  *sqlstore.Container
 	waLock       sync.Mutex
@@ -73,7 +72,7 @@ func main() {
 		port = "8080"
 	}
 
-	fmt.Println("Beeper-Clone Server Robusto ativo na porta " + port)
+	fmt.Println("Beeper-Clone Server com Pairing Code ativo na porta " + port)
 	err := http.ListenAndServe(":"+port, nil)
 	if err != nil {
 		log.Fatal("Erro fatal: ", err)
@@ -129,9 +128,9 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	client := &Client{ID: userId, Conn: ws, Send: make(chan []byte, 256)}
 	register <- client
 
-	// Heartbeat / Ping writer para evitar timeouts do Render
+	// Heartbeat / Ping a cada 20 segundos para manter vivo no Render
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(20 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			clientLock.Lock()
@@ -140,11 +139,7 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			clientLock.Unlock()
-
-			err := ws.WriteMessage(websocket.PingMessage, nil)
-			if err != nil {
-				return
-			}
+			_ = ws.WriteMessage(websocket.PingMessage, nil)
 		}
 	}()
 
@@ -183,6 +178,11 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 				go startRealWhatsAppBridge(client)
 			}
 
+		case "PAIR_PHONE":
+			if norm == "whatsapp" {
+				go handlePairPhoneWhatsApp(client, appMsg.Payload)
+			}
+
 		case "SEND_MESSAGE":
 			if norm == "whatsapp" && waClient != nil && waClient.IsConnected() {
 				recipient := appMsg.Recipient
@@ -194,29 +194,78 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 					_, _ = waClient.SendMessage(context.Background(), jid, &waE2E.Message{
 						Conversation: &appMsg.Payload,
 					})
-					fmt.Println("Mensagem enviada via WhatsApp para:", recipient)
+					fmt.Println("Mensagem enviada com sucesso para:", recipient)
 				}
 			}
 		}
 	}
 }
 
-func startRealWhatsAppBridge(client *Client) {
+func ensureClientInitialized() error {
+	if waClient != nil {
+		return nil
+	}
+	if waContainer == nil {
+		return fmt.Errorf("container is nil")
+	}
+	deviceStore, err := waContainer.GetFirstDevice(context.Background())
+	if err != nil {
+		return err
+	}
+	clientLog := waLog.Stdout("Client", "INFO", true)
+	waClient = whatsmeow.NewClient(deviceStore, clientLog)
+	setupEventHandlers()
+	return nil
+}
+
+func handlePairPhoneWhatsApp(client *Client, phone string) {
 	waLock.Lock()
 	defer waLock.Unlock()
 
-	if waContainer == nil {
-		return
-	}
-
-	deviceStore, err := waContainer.GetFirstDevice(context.Background())
+	err := ensureClientInitialized()
 	if err != nil {
 		return
 	}
 
-	clientLog := waLog.Stdout("Client", "INFO", true)
-	if waClient == nil {
-		waClient = whatsmeow.NewClient(deviceStore, clientLog)
+	if !waClient.IsConnected() {
+		_ = waClient.Connect()
+	}
+
+	// Limpar caracteres não numéricos do telefone
+	cleanPhone := strings.ReplaceAll(phone, "+", "")
+	cleanPhone = strings.ReplaceAll(cleanPhone, " ", "")
+	cleanPhone = strings.ReplaceAll(cleanPhone, "-", "")
+
+	fmt.Printf("A pedir código de emparelhamento para: %s\n", cleanPhone)
+	code, err := waClient.PairPhone(cleanPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+	if err != nil {
+		fmt.Println("Erro PairPhone:", err)
+		sendToClient(client, ServerResponse{
+			Type:      "BRIDGE_STATUS",
+			Network:   "whatsapp",
+			Status:    "Erro ao gerar código: " + err.Error(),
+			Connected: false,
+		})
+		return
+	}
+
+	fmt.Println("Código de emparelhamento gerado com sucesso:", code)
+	sendToClient(client, ServerResponse{
+		Type:      "BRIDGE_QR",
+		Network:   "whatsapp",
+		Status:    "Insere este código no WhatsApp",
+		Payload:   code, // Código de 8 dígitos, ex: ABCD-1234
+		Connected: false,
+	})
+}
+
+func startRealWhatsAppBridge(client *Client) {
+	waLock.Lock()
+	defer waLock.Unlock()
+
+	err := ensureClientInitialized()
+	if err != nil {
+		return
 	}
 
 	if waClient.Store.ID != nil {
@@ -229,11 +278,8 @@ func startRealWhatsAppBridge(client *Client) {
 			Status:    "Conectado",
 			Connected: true,
 		})
-		setupEventHandlers()
 		return
 	}
-
-	setupEventHandlers()
 
 	qrChan, err := waClient.GetQRChannel(context.Background())
 	if err != nil {
@@ -266,7 +312,7 @@ func startRealWhatsAppBridge(client *Client) {
 				sendToClient(client, ServerResponse{
 					Type:      "BRIDGE_QR",
 					Network:   "whatsapp",
-					Status:    "Lê o QR Code com o teu telemóvel",
+					Status:    "Lê o QR Code com o WhatsApp",
 					Payload:   payload,
 					Connected: false,
 				})
