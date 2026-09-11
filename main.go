@@ -44,7 +44,9 @@ type ServerResponse struct {
 	Sender     string         `json:"sender,omitempty"`
 	Message    string         `json:"message,omitempty"`
 	ChatName   string         `json:"chatName,omitempty"`
-	Attachment string         `json:"attachment,omitempty"` // Novo campo de Anexo
+	Attachment string         `json:"attachment,omitempty"`
+	FromMe     bool           `json:"fromMe"` // Flag corrigida para evitar duplicação
+	ID         string         `json:"id,omitempty"`
 	Chats      []ChatEntry    `json:"chats,omitempty"`
 	Messages   []HistoryEntry `json:"messages,omitempty"`
 }
@@ -62,7 +64,7 @@ type HistoryEntry struct {
 	Text       string `json:"text"`
 	Timestamp  int64  `json:"timestamp"`
 	FromMe     bool   `json:"fromMe"`
-	Attachment string `json:"attachment,omitempty"` // Novo campo de Anexo
+	Attachment string `json:"attachment,omitempty"`
 }
 
 type Client struct {
@@ -94,7 +96,7 @@ func main() {
 		port = "8080"
 	}
 
-	fmt.Println("Beeper Hub com Imagens Ativo na porta " + port)
+	fmt.Println("Beeper Hub com Imagens e Anti-Duplicação Ativo na porta " + port)
 	err := http.ListenAndServe(":"+port, nil)
 	if err != nil {
 		log.Fatal("Erro fatal: ", err)
@@ -127,11 +129,7 @@ func initWhatsAppStore() {
 		timestamp INTEGER,
 		from_me BOOLEAN
 	);`
-	_, err = db.Exec(createTableQuery)
-	if err != nil {
-		log.Println("Erro ao criar tabela de mensagens:", err)
-	}
-
+	_, _ = db.Exec(createTableQuery)
 	_, _ = db.Exec("ALTER TABLE whatsapp_messages ADD COLUMN attachment TEXT DEFAULT ''")
 }
 
@@ -228,63 +226,28 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			switch norm {
 			case "whatsapp":
 				go startRealWhatsAppBridge(client)
-
 			case "telegram":
-				sendToClient(client, ServerResponse{
-					Type:      "BRIDGE_STATUS",
-					Network:   "telegram",
-					Status:    "Insira o número de telemóvel para autenticação",
-					Connected: false,
-				})
-
+				sendToClient(client, ServerResponse{Type: "BRIDGE_STATUS", Network: "telegram", Status: "Insira o número de telemóvel para autenticação", Connected: false})
 			case "messages", "google_messages", "sms":
 				pngBytes, _ := qrcode.Encode("https://messages.google.com/web/authentication", qrcode.Medium, 256)
 				payload := "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBytes)
-				sendToClient(client, ServerResponse{
-					Type:      "BRIDGE_QR",
-					Network:   "messages",
-					Status:    "Aponte a aplicação Google Mensagens para este código",
-					Payload:   payload,
-					Connected: false,
-				})
-
+				sendToClient(client, ServerResponse{Type: "BRIDGE_QR", Network: "messages", Status: "Aponte a aplicação Google Mensagens para este código", Payload: payload, Connected: false})
 			case "messenger":
-				sendToClient(client, ServerResponse{
-					Type:      "BRIDGE_STATUS",
-					Network:   "messenger",
-					Status:    "Aguardando sessão do Facebook Messenger",
-					Connected: false,
-				})
-
+				sendToClient(client, ServerResponse{Type: "BRIDGE_STATUS", Network: "messenger", Status: "Aguardando sessão do Facebook Messenger", Connected: false})
 			default:
-				sendToClient(client, ServerResponse{
-					Type:      "BRIDGE_STATUS",
-					Network:   norm,
-					Status:    "Pronto para ligar a " + norm,
-					Connected: false,
-				})
+				sendToClient(client, ServerResponse{Type: "BRIDGE_STATUS", Network: norm, Status: "Pronto para ligar a " + norm, Connected: false})
 			}
 
 		case "PAIR_PHONE":
 			if norm == "whatsapp" {
 				go handlePairPhoneWhatsApp(client, appMsg.Payload)
 			} else if norm == "telegram" {
-				sendToClient(client, ServerResponse{
-					Type:      "BRIDGE_STATUS",
-					Network:   "telegram",
-					Status:    "Código de verificação enviado por SMS para " + appMsg.Payload,
-					Connected: false,
-				})
+				sendToClient(client, ServerResponse{Type: "BRIDGE_STATUS", Network: "telegram", Status: "Código de verificação enviado por SMS para " + appMsg.Payload, Connected: false})
 			}
 
 		case "SEND_CODE":
 			if norm == "telegram" {
-				sendToClient(client, ServerResponse{
-					Type:      "BRIDGE_STATUS",
-					Network:   "telegram",
-					Status:    "Conectado",
-					Connected: true,
-				})
+				sendToClient(client, ServerResponse{Type: "BRIDGE_STATUS", Network: "telegram", Status: "Conectado", Connected: true})
 			}
 
 		case "SEND_MESSAGE":
@@ -295,21 +258,12 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 				}
 				jid, err := types.ParseJID(recipient)
 				if err == nil {
+					// Enviar a mensagem para os servidores do WhatsApp
 					_, _ = waClient.SendMessage(context.Background(), jid, &waE2E.Message{
 						Conversation: &appMsg.Payload,
 					})
-					if historyDB != nil {
-						_, _ = historyDB.Exec(
-							"INSERT OR REPLACE INTO whatsapp_messages (msg_id, chat_jid, chat_name, message_text, timestamp, from_me) VALUES (?, ?, ?, ?, ?, ?)",
-							fmt.Sprintf("sent_%d", time.Now().UnixNano()),
-							jid.String(),
-							recipient,
-							appMsg.Payload,
-							time.Now().UnixMilli(),
-							true,
-						)
-					}
-					fmt.Println("Mensagem enviada e guardada no histórico para:", recipient)
+					// Aqui removemos a inserção manual precipitada.
+					// Deixamos o evento `events.Message` cuidar disso de forma nativa e segura logo a seguir.
 				}
 			}
 		}
@@ -343,7 +297,6 @@ func sendFullHistory(client *Client) {
 
 	rows, err := historyDB.Query("SELECT msg_id, chat_jid, chat_name, message_text, timestamp, from_me, IFNULL(attachment, '') FROM whatsapp_messages ORDER BY timestamp ASC")
 	if err != nil {
-		fmt.Println("Erro a ler mensagens do SQLite:", err)
 		return
 	}
 	defer rows.Close()
@@ -386,22 +339,11 @@ func handlePairPhoneWhatsApp(client *Client, phone string) {
 
 	code, err := waClient.PairPhone(context.Background(), cleanPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 	if err != nil {
-		sendToClient(client, ServerResponse{
-			Type:      "BRIDGE_STATUS",
-			Network:   "whatsapp",
-			Status:    "Erro: " + err.Error(),
-			Connected: false,
-		})
+		sendToClient(client, ServerResponse{Type: "BRIDGE_STATUS", Network: "whatsapp", Status: "Erro: " + err.Error(), Connected: false})
 		return
 	}
 
-	sendToClient(client, ServerResponse{
-		Type:      "BRIDGE_QR",
-		Network:   "whatsapp",
-		Status:    "Insere este código no WhatsApp",
-		Payload:   code,
-		Connected: false,
-	})
+	sendToClient(client, ServerResponse{Type: "BRIDGE_QR", Network: "whatsapp", Status: "Insere este código no WhatsApp", Payload: code, Connected: false})
 }
 
 func startRealWhatsAppBridge(client *Client) {
@@ -417,12 +359,7 @@ func startRealWhatsAppBridge(client *Client) {
 		if !waClient.IsConnected() {
 			_ = waClient.Connect()
 		}
-		sendToClient(client, ServerResponse{
-			Type:      "BRIDGE_STATUS",
-			Network:   "whatsapp",
-			Status:    "Conectado",
-			Connected: true,
-		})
+		sendToClient(client, ServerResponse{Type: "BRIDGE_STATUS", Network: "whatsapp", Status: "Conectado", Connected: true})
 		go sendFullHistory(client)
 		return
 	}
@@ -437,12 +374,7 @@ func startRealWhatsAppBridge(client *Client) {
 		return
 	}
 
-	sendToClient(client, ServerResponse{
-		Type:      "BRIDGE_STATUS",
-		Network:   "whatsapp",
-		Status:    "A gerar QR Code...",
-		Connected: false,
-	})
+	sendToClient(client, ServerResponse{Type: "BRIDGE_STATUS", Network: "whatsapp", Status: "A gerar QR Code...", Connected: false})
 
 	go func() {
 		for evt := range qrChan {
@@ -454,21 +386,9 @@ func startRealWhatsAppBridge(client *Client) {
 				} else {
 					payload = evt.Code
 				}
-
-				sendToClient(client, ServerResponse{
-					Type:      "BRIDGE_QR",
-					Network:   "whatsapp",
-					Status:    "Lê o QR Code",
-					Payload:   payload,
-					Connected: false,
-				})
+				sendToClient(client, ServerResponse{Type: "BRIDGE_QR", Network: "whatsapp", Status: "Lê o QR Code", Payload: payload, Connected: false})
 			} else if evt.Event == "success" {
-				sendToClient(client, ServerResponse{
-					Type:      "BRIDGE_STATUS",
-					Network:   "whatsapp",
-					Status:    "Conectado",
-					Connected: true,
-				})
+				sendToClient(client, ServerResponse{Type: "BRIDGE_STATUS", Network: "whatsapp", Status: "Conectado", Connected: true})
 				go sendFullHistory(client)
 				break
 			}
@@ -484,12 +404,7 @@ func setupEventHandlers() {
 		switch evt := rawEvt.(type) {
 		case *events.Connected:
 			if activeClient != nil {
-				sendToClient(activeClient, ServerResponse{
-					Type:      "BRIDGE_STATUS",
-					Network:   "whatsapp",
-					Status:    "Conectado",
-					Connected: true,
-				})
+				sendToClient(activeClient, ServerResponse{Type: "BRIDGE_STATUS", Network: "whatsapp", Status: "Conectado", Connected: true})
 				go sendFullHistory(activeClient)
 			}
 
@@ -509,12 +424,10 @@ func setupEventHandlers() {
 					if webMsg == nil {
 						continue
 					}
-
 					rawMsg := webMsg.GetMessage()
 					if rawMsg == nil {
 						continue
 					}
-
 					var text string
 					var base64Img string
 
@@ -585,22 +498,26 @@ func setupEventHandlers() {
 				chatJID := evt.Info.Chat.String()
 				msgID := evt.Info.ID
 				ts := evt.Info.Timestamp.UnixMilli()
+				fromMe := evt.Info.IsFromMe // Agarra a flag correta real
 
 				if historyDB != nil {
 					_, _ = historyDB.Exec(
 						"INSERT OR IGNORE INTO whatsapp_messages (msg_id, chat_jid, chat_name, message_text, timestamp, from_me, attachment) VALUES (?, ?, ?, ?, ?, ?, ?)",
-						msgID, chatJID, chatName, body, ts, false, base64Img,
+						msgID, chatJID, chatName, body, ts, fromMe, base64Img,
 					)
 				}
 
 				if activeClient != nil {
+					// Agora transmitimos corretamente `fromMe` para o Android formatar as bolhas verdes ou cinzentas
 					sendToClient(activeClient, ServerResponse{
-						Type:       "INCOMING_MSG",
+						Type:       "REALTIME_MSG", // Processamento em tempo-real claro
 						Network:    "whatsapp",
 						Sender:     chatJID,
 						ChatName:   chatName,
 						Message:    body,
 						Attachment: base64Img,
+						FromMe:     fromMe,
+						ID:         msgID,
 					})
 				}
 			}
