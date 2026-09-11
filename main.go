@@ -504,8 +504,8 @@ func setupEventHandlers() {
 				}
 
 				for _, histMsg := range conv.GetMessages() {
-					// No WhatsMeow, histMsg.GetMsg() devolve o WebMessageInfo
-					webMsg := histMsg.GetMsg()
+					// histMsg.GetMessage() devolve o WebMessageInfo
+					webMsg := histMsg.GetMessage()
 					if webMsg == nil {
 						continue
 					}
