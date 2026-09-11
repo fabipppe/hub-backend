@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -307,7 +306,7 @@ func startRealWhatsAppBridge(client *Client) {
 				png, err := qrcode.Encode(evt.Code, qrcode.Medium, 256)
 				var payload string
 				if err == nil {
-					payload = "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)
+					payload = "data:image/png;base64,+base64.StdEncoding.EncodeToString(png)"
 				} else {
 					payload = evt.Code
 				}
@@ -343,25 +342,23 @@ func setupEventHandlers() {
 				sendToClient(activeClient, ServerResponse{
 					Type:      "BRIDGE_STATUS",
 					Network:   "whatsapp",
-					Status:    "Conectado",
+					Status:    "Conectado e Sincronizado",
 					Connected: true,
 				})
 			}
 		case *events.HistorySync:
-			// Captura o histórico sincronizado do WhatsApp e envia conversas para a app
 			if activeClient != nil && evt.Data != nil {
 				fmt.Printf("Histórico sincronizado recebido: %d conversas\n", len(evt.Data.GetConversations()))
 				for _, conv := range evt.Data.GetConversations() {
-					chatName := conv.GetId()
+					chatName := conv.GetID()
 					if conv.GetName() != "" {
 						chatName = conv.GetName()
 					}
 
-					// Envia cada chat do histórico para a app preencher
 					sendToClient(activeClient, ServerResponse{
 						Type:     "INCOMING_MSG",
 						Network:  "whatsapp",
-						Sender:   conv.GetId(),
+						Sender:   conv.GetID(),
 						ChatName: chatName,
 						Message:  "[Histórico sincronizado]",
 					})
