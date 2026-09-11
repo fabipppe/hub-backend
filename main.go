@@ -132,7 +132,6 @@ func initWhatsAppStore() {
 		log.Println("Erro ao criar tabela de mensagens:", err)
 	}
 
-	// Adicionar coluna 'attachment' em background, se não existir (Migração)
 	_, _ = db.Exec("ALTER TABLE whatsapp_messages ADD COLUMN attachment TEXT DEFAULT ''")
 }
 
@@ -181,7 +180,6 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	client := &Client{ID: userId, Conn: ws, Send: make(chan []byte, 256)}
 	register <- client
 
-	// Heartbeat periódico (15s)
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
@@ -359,7 +357,6 @@ func sendFullHistory(client *Client) {
 	}
 
 	if len(messageList) > 0 {
-		fmt.Printf("A enviar %d mensagens reais de histórico para a app!\n", len(messageList))
 		sendToClient(client, ServerResponse{
 			Type:      "HISTORY_MESSAGES",
 			Network:   "whatsapp",
@@ -500,7 +497,6 @@ func setupEventHandlers() {
 			if evt.Data == nil || historyDB == nil {
 				return
 			}
-			fmt.Printf("HistorySync recebido com %d conversas para gravar no histórico real!\n", len(evt.Data.GetConversations()))
 			for _, conv := range evt.Data.GetConversations() {
 				chatJID := conv.GetID()
 				chatName := conv.GetName()
@@ -531,7 +527,6 @@ func setupEventHandlers() {
 						if text == "" {
 							text = "[Imagem]"
 						}
-						// Descarregar a imagem para renderizar na UI
 						if data, err := waClient.Download(context.Background(), imgMsg); err == nil {
 							mime := imgMsg.GetMimetype()
 							if mime == "" {
@@ -573,7 +568,6 @@ func setupEventHandlers() {
 				if body == "" {
 					body = "[Imagem]"
 				}
-				// Download da imagem em tempo real
 				if data, err := waClient.Download(context.Background(), imgMsg); err == nil {
 					mime := imgMsg.GetMimetype()
 					if mime == "" {
