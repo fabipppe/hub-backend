@@ -36,16 +36,17 @@ type AppMessage struct {
 }
 
 type ServerResponse struct {
-	Type      string         `json:"type"`
-	Network   string         `json:"network"`
-	Status    string         `json:"status,omitempty"`
-	Connected bool           `json:"connected"`
-	Payload   string         `json:"payload,omitempty"`
-	Sender    string         `json:"sender,omitempty"`
-	Message   string         `json:"message,omitempty"`
-	ChatName  string         `json:"chatName,omitempty"`
-	Chats     []ChatEntry    `json:"chats,omitempty"`
-	Messages  []HistoryEntry `json:"messages,omitempty"`
+	Type       string         `json:"type"`
+	Network    string         `json:"network"`
+	Status     string         `json:"status,omitempty"`
+	Connected  bool           `json:"connected"`
+	Payload    string         `json:"payload,omitempty"`
+	Sender     string         `json:"sender,omitempty"`
+	Message    string         `json:"message,omitempty"`
+	ChatName   string         `json:"chatName,omitempty"`
+	Attachment string         `json:"attachment,omitempty"` // Novo campo de Anexo
+	Chats      []ChatEntry    `json:"chats,omitempty"`
+	Messages   []HistoryEntry `json:"messages,omitempty"`
 }
 
 type ChatEntry struct {
@@ -55,12 +56,13 @@ type ChatEntry struct {
 }
 
 type HistoryEntry struct {
-	ID        string `json:"id"`
-	ChatJID   string `json:"chatJid"`
-	ChatName  string `json:"chatName"`
-	Text      string `json:"text"`
-	Timestamp int64  `json:"timestamp"`
-	FromMe    bool   `json:"fromMe"`
+	ID         string `json:"id"`
+	ChatJID    string `json:"chatJid"`
+	ChatName   string `json:"chatName"`
+	Text       string `json:"text"`
+	Timestamp  int64  `json:"timestamp"`
+	FromMe     bool   `json:"fromMe"`
+	Attachment string `json:"attachment,omitempty"` // Novo campo de Anexo
 }
 
 type Client struct {
@@ -92,7 +94,7 @@ func main() {
 		port = "8080"
 	}
 
-	fmt.Println("Beeper Hub com Histórico Real Ativo na porta " + port)
+	fmt.Println("Beeper Hub com Imagens Ativo na porta " + port)
 	err := http.ListenAndServe(":"+port, nil)
 	if err != nil {
 		log.Fatal("Erro fatal: ", err)
@@ -129,6 +131,9 @@ func initWhatsAppStore() {
 	if err != nil {
 		log.Println("Erro ao criar tabela de mensagens:", err)
 	}
+
+	// Adicionar coluna 'attachment' em background, se não existir (Migração)
+	_, _ = db.Exec("ALTER TABLE whatsapp_messages ADD COLUMN attachment TEXT DEFAULT ''")
 }
 
 func runHub() {
@@ -338,7 +343,7 @@ func sendFullHistory(client *Client) {
 		return
 	}
 
-	rows, err := historyDB.Query("SELECT msg_id, chat_jid, chat_name, message_text, timestamp, from_me FROM whatsapp_messages ORDER BY timestamp ASC")
+	rows, err := historyDB.Query("SELECT msg_id, chat_jid, chat_name, message_text, timestamp, from_me, IFNULL(attachment, '') FROM whatsapp_messages ORDER BY timestamp ASC")
 	if err != nil {
 		fmt.Println("Erro a ler mensagens do SQLite:", err)
 		return
@@ -348,7 +353,7 @@ func sendFullHistory(client *Client) {
 	var messageList []HistoryEntry
 	for rows.Next() {
 		var m HistoryEntry
-		if err := rows.Scan(&m.ID, &m.ChatJID, &m.ChatName, &m.Text, &m.Timestamp, &m.FromMe); err == nil {
+		if err := rows.Scan(&m.ID, &m.ChatJID, &m.ChatName, &m.Text, &m.Timestamp, &m.FromMe, &m.Attachment); err == nil {
 			messageList = append(messageList, m)
 		}
 	}
@@ -515,15 +520,28 @@ func setupEventHandlers() {
 					}
 
 					var text string
+					var base64Img string
+
 					if rawMsg.GetConversation() != "" {
 						text = rawMsg.GetConversation()
 					} else if rawMsg.GetExtendedTextMessage() != nil {
 						text = rawMsg.GetExtendedTextMessage().GetText()
-					} else if rawMsg.GetImageMessage() != nil {
-						text = "[Imagem] " + rawMsg.GetImageMessage().GetCaption()
+					} else if imgMsg := rawMsg.GetImageMessage(); imgMsg != nil {
+						text = imgMsg.GetCaption()
+						if text == "" {
+							text = "[Imagem]"
+						}
+						// Descarregar a imagem para renderizar na UI
+						if data, err := waClient.Download(imgMsg); err == nil {
+							mime := imgMsg.GetMimetype()
+							if mime == "" {
+								mime = "image/jpeg"
+							}
+							base64Img = "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)
+						}
 					}
 
-					if text == "" {
+					if text == "" && base64Img == "" {
 						continue
 					}
 
@@ -532,8 +550,8 @@ func setupEventHandlers() {
 					ts := int64(webMsg.GetMessageTimestamp()) * 1000
 
 					_, _ = historyDB.Exec(
-						"INSERT OR IGNORE INTO whatsapp_messages (msg_id, chat_jid, chat_name, message_text, timestamp, from_me) VALUES (?, ?, ?, ?, ?, ?)",
-						msgID, chatJID, chatName, text, ts, fromMe,
+						"INSERT OR IGNORE INTO whatsapp_messages (msg_id, chat_jid, chat_name, message_text, timestamp, from_me, attachment) VALUES (?, ?, ?, ?, ?, ?, ?)",
+						msgID, chatJID, chatName, text, ts, fromMe, base64Img,
 					)
 				}
 			}
@@ -544,15 +562,28 @@ func setupEventHandlers() {
 
 		case *events.Message:
 			var body string
+			var base64Img string
+
 			if evt.Message.GetConversation() != "" {
 				body = evt.Message.GetConversation()
 			} else if evt.Message.GetExtendedTextMessage() != nil {
 				body = evt.Message.GetExtendedTextMessage().GetText()
-			} else if evt.Message.GetImageMessage() != nil {
-				body = "[Imagem] " + evt.Message.GetImageMessage().GetCaption()
+			} else if imgMsg := evt.Message.GetImageMessage(); imgMsg != nil {
+				body = imgMsg.GetCaption()
+				if body == "" {
+					body = "[Imagem]"
+				}
+				// Download da imagem em tempo real
+				if data, err := waClient.Download(imgMsg); err == nil {
+					mime := imgMsg.GetMimetype()
+					if mime == "" {
+						mime = "image/jpeg"
+					}
+					base64Img = "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)
+				}
 			}
 
-			if body != "" {
+			if body != "" || base64Img != "" {
 				chatName := evt.Info.PushName
 				if chatName == "" {
 					chatName = evt.Info.Sender.User
@@ -563,18 +594,19 @@ func setupEventHandlers() {
 
 				if historyDB != nil {
 					_, _ = historyDB.Exec(
-						"INSERT OR IGNORE INTO whatsapp_messages (msg_id, chat_jid, chat_name, message_text, timestamp, from_me) VALUES (?, ?, ?, ?, ?, ?)",
-						msgID, chatJID, chatName, body, ts, false,
+						"INSERT OR IGNORE INTO whatsapp_messages (msg_id, chat_jid, chat_name, message_text, timestamp, from_me, attachment) VALUES (?, ?, ?, ?, ?, ?, ?)",
+						msgID, chatJID, chatName, body, ts, false, base64Img,
 					)
 				}
 
 				if activeClient != nil {
 					sendToClient(activeClient, ServerResponse{
-						Type:     "INCOMING_MSG",
-						Network:  "whatsapp",
-						Sender:   chatJID,
-						ChatName: chatName,
-						Message:  body,
+						Type:       "INCOMING_MSG",
+						Network:    "whatsapp",
+						Sender:     chatJID,
+						ChatName:   chatName,
+						Message:    body,
+						Attachment: base64Img,
 					})
 				}
 			}
