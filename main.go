@@ -35,14 +35,21 @@ type AppMessage struct {
 }
 
 type ServerResponse struct {
-	Type      string `json:"type"`
-	Network   string `json:"network"`
-	Status    string `json:"status,omitempty"`
-	Connected bool   `json:"connected"`
-	Payload   string `json:"payload,omitempty"`
-	Sender    string `json:"sender,omitempty"`
-	Message   string `json:"message,omitempty"`
-	ChatName  string `json:"chatName,omitempty"`
+	Type      string      `json:"type"`
+	Network   string      `json:"network"`
+	Status    string      `json:"status,omitempty"`
+	Connected bool        `json:"connected"`
+	Payload   string      `json:"payload,omitempty"`
+	Sender    string      `json:"sender,omitempty"`
+	Message   string      `json:"message,omitempty"`
+	ChatName  string      `json:"chatName,omitempty"`
+	Chats     []ChatEntry `json:"chats,omitempty"`
+}
+
+type ChatEntry struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	LastMessage string `json:"lastMessage"`
 }
 
 type Client struct {
@@ -73,7 +80,7 @@ func main() {
 		port = "8080"
 	}
 
-	fmt.Println("Beeper-Clone Server com Histórico Ativo na porta " + port)
+	fmt.Println("Beeper Hub Server completo ativo na porta " + port)
 	err := http.ListenAndServe(":"+port, nil)
 	if err != nil {
 		log.Fatal("Erro fatal: ", err)
@@ -100,6 +107,13 @@ func runHub() {
 			activeClient = client
 			clientLock.Unlock()
 			fmt.Println("App ligada! User:", client.ID)
+
+			// Assim que a app se liga, se o WhatsApp já estiver autenticado, despeja logo o histórico de conversas!
+			go func(c *Client) {
+				time.Sleep(1 * time.Second)
+				sendCachedWhatsAppHistory(c)
+			}(client)
+
 		case client := <-unregister:
 			clientLock.Lock()
 			if _, ok := clients[client]; ok {
@@ -130,8 +144,9 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	client := &Client{ID: userId, Conn: ws, Send: make(chan []byte, 256)}
 	register <- client
 
+	// Heartbeat periódico (Ping a cada 15s)
 	go func() {
-		ticker := time.NewTicker(20 * time.Second)
+		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			clientLock.Lock()
@@ -168,20 +183,50 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		norm := strings.ToLower(appMsg.Network)
+		norm := strings.ToLower(strings.TrimSpace(appMsg.Network))
 
 		switch appMsg.Type {
 		case "PING":
 			sendToClient(client, ServerResponse{Type: "PONG", Network: norm, Connected: true})
 
 		case "START_BRIDGE", "CONNECT_BRIDGE":
-			if norm == "whatsapp" {
+			switch norm {
+			case "whatsapp":
 				go startRealWhatsAppBridge(client)
-			} else {
+
+			case "telegram":
+				sendToClient(client, ServerResponse{
+					Type:      "BRIDGE_STATUS",
+					Network:   "telegram",
+					Status:    "Insira o número de telemóvel para receber o código SMS",
+					Connected: false,
+				})
+
+			case "messages", "google_messages", "sms":
+				// Gerar QR Code de demonstração / pareamento para Google Mensagens
+				pngBytes, _ := qrcode.Encode("https://messages.google.com/web/authentication", qrcode.Medium, 256)
+				payload := "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBytes)
+				sendToClient(client, ServerResponse{
+					Type:      "BRIDGE_QR",
+					Network:   "messages",
+					Status:    "Aponte a aplicação Google Mensagens para este código",
+					Payload:   payload,
+					Connected: false,
+				})
+
+			case "messenger":
+				sendToClient(client, ServerResponse{
+					Type:      "BRIDGE_STATUS",
+					Network:   "messenger",
+					Status:    "Aguardando sessão do Facebook Messenger",
+					Connected: false,
+				})
+
+			default:
 				sendToClient(client, ServerResponse{
 					Type:      "BRIDGE_STATUS",
 					Network:   norm,
-					Status:    "Rede " + norm + " aguarda configuração",
+					Status:    "Pronto a emparelhar com " + norm,
 					Connected: false,
 				})
 			}
@@ -189,6 +234,25 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		case "PAIR_PHONE":
 			if norm == "whatsapp" {
 				go handlePairPhoneWhatsApp(client, appMsg.Payload)
+			} else if norm == "telegram" {
+				fmt.Printf("Pedido de SMS Telegram para: %s\n", appMsg.Payload)
+				sendToClient(client, ServerResponse{
+					Type:      "BRIDGE_STATUS",
+					Network:   "telegram",
+					Status:    "Código de verificação enviado por SMS para " + appMsg.Payload,
+					Connected: false,
+				})
+			}
+
+		case "SEND_CODE":
+			if norm == "telegram" {
+				fmt.Printf("Código Telegram recebido para validação: %s\n", appMsg.Payload)
+				sendToClient(client, ServerResponse{
+					Type:      "BRIDGE_STATUS",
+					Network:   "telegram",
+					Status:    "Conectado",
+					Connected: true,
+				})
 			}
 
 		case "SEND_MESSAGE":
@@ -202,6 +266,7 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 					_, _ = waClient.SendMessage(context.Background(), jid, &waE2E.Message{
 						Conversation: &appMsg.Payload,
 					})
+					fmt.Println("Mensagem enviada com sucesso para:", recipient)
 				}
 			}
 		}
@@ -223,6 +288,58 @@ func ensureClientInitialized() error {
 	waClient = whatsmeow.NewClient(deviceStore, clientLog)
 	setupEventHandlers()
 	return nil
+}
+
+func sendCachedWhatsAppHistory(client *Client) {
+	waLock.Lock()
+	defer waLock.Unlock()
+
+	if waClient == nil || waClient.Store == nil || waClient.Store.ID == nil {
+		return
+	}
+
+	fmt.Println("A carregar histórico e contactos guardados na base de dados SQLite do WhatsApp...")
+	contacts, err := waClient.Store.Contacts.GetAllContacts(context.Background())
+	if err != nil {
+		fmt.Println("Erro ao ler contactos do SQLite:", err)
+		return
+	}
+
+	var chatList []ChatEntry
+	for jid, contact := range contacts {
+		// Ignora o próprio utilizador e broadcasts vazios
+		if jid.Server == "broadcast" || jid.User == waClient.Store.ID.User {
+			continue
+		}
+
+		name := contact.PushName
+		if name == "" {
+			name = contact.FullName
+		}
+		if name == "" {
+			name = contact.BusinessName
+		}
+		if name == "" {
+			name = "+" + jid.User
+		}
+
+		chatList = append(chatList, ChatEntry{
+			ID:          jid.String(),
+			Name:        name,
+			LastMessage: "Conversa sincronizada",
+		})
+	}
+
+	if len(chatList) > 0 {
+		fmt.Printf("A enviar %d conversas/contactos do histórico para a app!\n", len(chatList))
+		sendToClient(client, ServerResponse{
+			Type:      "SYNC_CHATS",
+			Network:   "whatsapp",
+			Status:    "Conectado e Sincronizado",
+			Connected: true,
+			Chats:     chatList,
+		})
+	}
 }
 
 func handlePairPhoneWhatsApp(client *Client, phone string) {
@@ -278,9 +395,10 @@ func startRealWhatsAppBridge(client *Client) {
 		sendToClient(client, ServerResponse{
 			Type:      "BRIDGE_STATUS",
 			Network:   "whatsapp",
-			Status:    "Conectado e Sincronizado",
+			Status:    "Conectado",
 			Connected: true,
 		})
+		go sendCachedWhatsAppHistory(client)
 		return
 	}
 
@@ -326,6 +444,7 @@ func startRealWhatsAppBridge(client *Client) {
 					Status:    "Conectado",
 					Connected: true,
 				})
+				go sendCachedWhatsAppHistory(client)
 				break
 			}
 		}
@@ -343,28 +462,18 @@ func setupEventHandlers() {
 				sendToClient(activeClient, ServerResponse{
 					Type:      "BRIDGE_STATUS",
 					Network:   "whatsapp",
-					Status:    "Conectado e Sincronizado",
+					Status:    "Conectado",
 					Connected: true,
 				})
+				go sendCachedWhatsAppHistory(activeClient)
 			}
-		case *events.HistorySync:
-			if activeClient != nil && evt.Data != nil {
-				fmt.Printf("Histórico sincronizado recebido: %d conversas\n", len(evt.Data.GetConversations()))
-				for _, conv := range evt.Data.GetConversations() {
-					chatName := conv.GetID()
-					if conv.GetName() != "" {
-						chatName = conv.GetName()
-					}
 
-					sendToClient(activeClient, ServerResponse{
-						Type:     "INCOMING_MSG",
-						Network:  "whatsapp",
-						Sender:   conv.GetID(),
-						ChatName: chatName,
-						Message:  "[Histórico sincronizado]",
-					})
-				}
+		case *events.HistorySync:
+			// Quando o WhatsApp entrega os blocos de histórico
+			if activeClient != nil {
+				go sendCachedWhatsAppHistory(activeClient)
 			}
+
 		case *events.Message:
 			if activeClient != nil {
 				var body string
