@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -35,21 +36,31 @@ type AppMessage struct {
 }
 
 type ServerResponse struct {
-	Type      string      `json:"type"`
-	Network   string      `json:"network"`
-	Status    string      `json:"status,omitempty"`
-	Connected bool        `json:"connected"`
-	Payload   string      `json:"payload,omitempty"`
-	Sender    string      `json:"sender,omitempty"`
-	Message   string      `json:"message,omitempty"`
-	ChatName  string      `json:"chatName,omitempty"`
-	Chats     []ChatEntry `json:"chats,omitempty"`
+	Type      string         `json:"type"`
+	Network   string         `json:"network"`
+	Status    string         `json:"status,omitempty"`
+	Connected bool           `json:"connected"`
+	Payload   string         `json:"payload,omitempty"`
+	Sender    string         `json:"sender,omitempty"`
+	Message   string         `json:"message,omitempty"`
+	ChatName  string         `json:"chatName,omitempty"`
+	Chats     []ChatEntry    `json:"chats,omitempty"`
+	Messages  []HistoryEntry `json:"messages,omitempty"`
 }
 
 type ChatEntry struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	LastMessage string `json:"lastMessage"`
+}
+
+type HistoryEntry struct {
+	ID        string `json:"id"`
+	ChatJID   string `json:"chatJid"`
+	ChatName  string `json:"chatName"`
+	Text      string `json:"text"`
+	Timestamp int64  `json:"timestamp"`
+	FromMe    bool   `json:"fromMe"`
 }
 
 type Client struct {
@@ -65,6 +76,7 @@ var (
 	clientLock   sync.Mutex
 	waClient     *whatsmeow.Client
 	waContainer  *sqlstore.Container
+	historyDB    *sql.DB
 	waLock       sync.Mutex
 	activeClient *Client
 )
@@ -80,7 +92,7 @@ func main() {
 		port = "8080"
 	}
 
-	fmt.Println("Beeper Hub Server completo ativo na porta " + port)
+	fmt.Println("Beeper Hub com Histórico Real Ativo na porta " + port)
 	err := http.ListenAndServe(":"+port, nil)
 	if err != nil {
 		log.Fatal("Erro fatal: ", err)
@@ -92,10 +104,32 @@ func initWhatsAppStore() {
 	connStr := "file:whatsapp.db?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_busy_timeout=5000"
 	container, err := sqlstore.New(context.Background(), "sqlite", connStr, dbLog)
 	if err != nil {
-		log.Println("Erro SQLite WhatsApp:", err)
+		log.Println("Erro SQLite WhatsMeow:", err)
 		return
 	}
 	waContainer = container
+
+	// Abrir ligação direta ao SQLite para guardar as mensagens do histórico
+	db, err := sql.Open("sqlite", connStr)
+	if err != nil {
+		log.Println("Erro ao abrir base de dados para histórico:", err)
+		return
+	}
+	historyDB = db
+
+	createTableQuery := `
+	CREATE TABLE IF NOT EXISTS whatsapp_messages (
+		msg_id TEXT PRIMARY KEY,
+		chat_jid TEXT,
+		chat_name TEXT,
+		message_text TEXT,
+		timestamp INTEGER,
+		from_me BOOLEAN
+	);`
+	_, err = db.Exec(createTableQuery)
+	if err != nil {
+		log.Println("Erro ao criar tabela de mensagens:", err)
+	}
 }
 
 func runHub() {
@@ -108,10 +142,9 @@ func runHub() {
 			clientLock.Unlock()
 			fmt.Println("App ligada! User:", client.ID)
 
-			// Assim que a app se liga, se o WhatsApp já estiver autenticado, despeja logo o histórico de conversas!
 			go func(c *Client) {
 				time.Sleep(1 * time.Second)
-				sendCachedWhatsAppHistory(c)
+				sendFullHistory(c)
 			}(client)
 
 		case client := <-unregister:
@@ -144,7 +177,7 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	client := &Client{ID: userId, Conn: ws, Send: make(chan []byte, 256)}
 	register <- client
 
-	// Heartbeat periódico (Ping a cada 15s)
+	// Heartbeat periódico (15s)
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
@@ -198,12 +231,11 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 				sendToClient(client, ServerResponse{
 					Type:      "BRIDGE_STATUS",
 					Network:   "telegram",
-					Status:    "Insira o número de telemóvel para receber o código SMS",
+					Status:    "Insira o número de telemóvel para autenticação",
 					Connected: false,
 				})
 
 			case "messages", "google_messages", "sms":
-				// Gerar QR Code de demonstração / pareamento para Google Mensagens
 				pngBytes, _ := qrcode.Encode("https://messages.google.com/web/authentication", qrcode.Medium, 256)
 				payload := "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBytes)
 				sendToClient(client, ServerResponse{
@@ -226,7 +258,7 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 				sendToClient(client, ServerResponse{
 					Type:      "BRIDGE_STATUS",
 					Network:   norm,
-					Status:    "Pronto a emparelhar com " + norm,
+					Status:    "Pronto para ligar a " + norm,
 					Connected: false,
 				})
 			}
@@ -235,7 +267,6 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			if norm == "whatsapp" {
 				go handlePairPhoneWhatsApp(client, appMsg.Payload)
 			} else if norm == "telegram" {
-				fmt.Printf("Pedido de SMS Telegram para: %s\n", appMsg.Payload)
 				sendToClient(client, ServerResponse{
 					Type:      "BRIDGE_STATUS",
 					Network:   "telegram",
@@ -246,7 +277,6 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 
 		case "SEND_CODE":
 			if norm == "telegram" {
-				fmt.Printf("Código Telegram recebido para validação: %s\n", appMsg.Payload)
 				sendToClient(client, ServerResponse{
 					Type:      "BRIDGE_STATUS",
 					Network:   "telegram",
@@ -266,7 +296,19 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 					_, _ = waClient.SendMessage(context.Background(), jid, &waE2E.Message{
 						Conversation: &appMsg.Payload,
 					})
-					fmt.Println("Mensagem enviada com sucesso para:", recipient)
+					// Guardar a mensagem enviada também no histórico local
+					if historyDB != nil {
+						_, _ = historyDB.Exec(
+							"INSERT OR REPLACE INTO whatsapp_messages (msg_id, chat_jid, chat_name, message_text, timestamp, from_me) VALUES (?, ?, ?, ?, ?, ?)",
+							fmt.Sprintf("sent_%d", time.Now().UnixNano()),
+							jid.String(),
+							recipient,
+							appMsg.Payload,
+							time.Now().UnixMilli(),
+							true,
+						)
+					}
+					fmt.Println("Mensagem enviada e guardada no histórico para:", recipient)
 				}
 			}
 		}
@@ -290,54 +332,38 @@ func ensureClientInitialized() error {
 	return nil
 }
 
-func sendCachedWhatsAppHistory(client *Client) {
+func sendFullHistory(client *Client) {
 	waLock.Lock()
 	defer waLock.Unlock()
 
-	if waClient == nil || waClient.Store == nil || waClient.Store.ID == nil {
+	if historyDB == nil {
 		return
 	}
 
-	fmt.Println("A carregar histórico e contactos guardados na base de dados SQLite do WhatsApp...")
-	contacts, err := waClient.Store.Contacts.GetAllContacts(context.Background())
+	// 1. Ler todas as mensagens reais guardadas no SQLite
+	rows, err := historyDB.Query("SELECT msg_id, chat_jid, chat_name, message_text, timestamp, from_me FROM whatsapp_messages ORDER BY timestamp ASC")
 	if err != nil {
-		fmt.Println("Erro ao ler contactos do SQLite:", err)
+		fmt.Println("Erro a ler mensagens do SQLite:", err)
 		return
 	}
+	defer rows.Close()
 
-	var chatList []ChatEntry
-	for jid, contact := range contacts {
-		// Ignora o próprio utilizador e broadcasts vazios
-		if jid.Server == "broadcast" || jid.User == waClient.Store.ID.User {
-			continue
+	var messageList []HistoryEntry
+	for rows.Next() {
+		var m HistoryEntry
+		if err := rows.Scan(&m.ID, &m.ChatJID, &m.ChatName, &m.Text, &m.Timestamp, &m.FromMe); err == nil {
+			messageList = append(messageList, m)
 		}
-
-		name := contact.PushName
-		if name == "" {
-			name = contact.FullName
-		}
-		if name == "" {
-			name = contact.BusinessName
-		}
-		if name == "" {
-			name = "+" + jid.User
-		}
-
-		chatList = append(chatList, ChatEntry{
-			ID:          jid.String(),
-			Name:        name,
-			LastMessage: "Conversa sincronizada",
-		})
 	}
 
-	if len(chatList) > 0 {
-		fmt.Printf("A enviar %d conversas/contactos do histórico para a app!\n", len(chatList))
+	if len(messageList) > 0 {
+		fmt.Printf("A enviar %d mensagens reais de histórico para a app!\n", len(messageList))
 		sendToClient(client, ServerResponse{
-			Type:      "SYNC_CHATS",
+			Type:      "HISTORY_MESSAGES",
 			Network:   "whatsapp",
-			Status:    "Conectado e Sincronizado",
+			Status:    "Histórico Completo",
 			Connected: true,
-			Chats:     chatList,
+			Messages:  messageList,
 		})
 	}
 }
@@ -398,7 +424,7 @@ func startRealWhatsAppBridge(client *Client) {
 			Status:    "Conectado",
 			Connected: true,
 		})
-		go sendCachedWhatsAppHistory(client)
+		go sendFullHistory(client)
 		return
 	}
 
@@ -444,7 +470,7 @@ func startRealWhatsAppBridge(client *Client) {
 					Status:    "Conectado",
 					Connected: true,
 				})
-				go sendCachedWhatsAppHistory(client)
+				go sendFullHistory(client)
 				break
 			}
 		}
@@ -465,33 +491,88 @@ func setupEventHandlers() {
 					Status:    "Conectado",
 					Connected: true,
 				})
-				go sendCachedWhatsAppHistory(activeClient)
+				go sendFullHistory(activeClient)
 			}
 
 		case *events.HistorySync:
-			// Quando o WhatsApp entrega os blocos de histórico
+			// Processar conversas e MENSAGENS REAIS do histórico
+			if evt.Data == nil || historyDB == nil {
+				return
+			}
+			fmt.Printf("HistorySync recebido com %d conversas para gravar no histórico real!\n", len(evt.Data.GetConversations()))
+			for _, conv := range evt.Data.GetConversations() {
+				chatJID := conv.GetID()
+				chatName := conv.GetName()
+				if chatName == "" {
+					chatName = chatJID
+				}
+
+				for _, histMsg := range conv.GetMessages() {
+					msg := histMsg.GetMessage()
+					if msg == nil {
+						continue
+					}
+
+					var text string
+					if msg.GetConversation() != "" {
+						text = msg.GetConversation()
+					} else if msg.GetExtendedTextMessage() != nil {
+						text = msg.GetExtendedTextMessage().GetText()
+					} else if msg.GetImageMessage() != nil {
+						text = "[Imagem] " + msg.GetImageMessage().GetCaption()
+					}
+
+					if text == "" {
+						continue
+					}
+
+					msgID := histMsg.GetKey().GetId()
+					fromMe := histMsg.GetKey().GetFromMe()
+					ts := int64(histMsg.GetMessageTimestamp()) * 1000
+
+					_, _ = historyDB.Exec(
+						"INSERT OR IGNORE INTO whatsapp_messages (msg_id, chat_jid, chat_name, message_text, timestamp, from_me) VALUES (?, ?, ?, ?, ?, ?)",
+						msgID, chatJID, chatName, text, ts, fromMe,
+					)
+				}
+			}
+
 			if activeClient != nil {
-				go sendCachedWhatsAppHistory(activeClient)
+				go sendFullHistory(activeClient)
 			}
 
 		case *events.Message:
-			if activeClient != nil {
-				var body string
-				if evt.Message.GetConversation() != "" {
-					body = evt.Message.GetConversation()
-				} else if evt.Message.GetExtendedTextMessage() != nil {
-					body = evt.Message.GetExtendedTextMessage().GetText()
+			var body string
+			if evt.Message.GetConversation() != "" {
+				body = evt.Message.GetConversation()
+			} else if evt.Message.GetExtendedTextMessage() != nil {
+				body = evt.Message.GetExtendedTextMessage().GetText()
+			} else if evt.Message.GetImageMessage() != nil {
+				body = "[Imagem] " + evt.Message.GetImageMessage().GetCaption()
+			}
+
+			if body != "" {
+				chatName := evt.Info.PushName
+				if chatName == "" {
+					chatName = evt.Info.Sender.User
+				}
+				chatJID := evt.Info.Chat.String()
+				msgID := evt.Info.ID
+				ts := evt.Info.Timestamp.UnixMilli()
+
+				// Guardar na tabela permanente de histórico
+				if historyDB != nil {
+					_, _ = historyDB.Exec(
+						"INSERT OR IGNORE INTO whatsapp_messages (msg_id, chat_jid, chat_name, message_text, timestamp, from_me) VALUES (?, ?, ?, ?, ?, ?)",
+						msgID, chatJID, chatName, body, ts, false,
+					)
 				}
 
-				if body != "" {
-					chatName := evt.Info.PushName
-					if chatName == "" {
-						chatName = evt.Info.Sender.User
-					}
+				if activeClient != nil {
 					sendToClient(activeClient, ServerResponse{
 						Type:     "INCOMING_MSG",
 						Network:  "whatsapp",
-						Sender:   evt.Info.Sender.User,
+						Sender:   chatJID,
 						ChatName: chatName,
 						Message:  body,
 					})
